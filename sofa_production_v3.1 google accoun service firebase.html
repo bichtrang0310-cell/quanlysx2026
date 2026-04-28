@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sofa Production Manager</title>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- Firebase compat SDK (không dùng module để tránh lỗi timing) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script>
+  const _fbApp = firebase.initializeApp({
+    apiKey: "AIzaSyA2CbTvff6OXuJF4LfkE5aByAcmfQBL4Gs",
+    authDomain: "quanlysanxuat-79eed.firebaseapp.com",
+    projectId: "quanlysanxuat-79eed",
+    storageBucket: "quanlysanxuat-79eed.firebasestorage.app",
+    messagingSenderId: "697221641881",
+    appId: "1:697221641881:web:3e6f913d041dbb1e7e2a08"
+  });
+  const _db = firebase.firestore();
+
+  function _setFbStatus(text, color, bg) {
+    var el = document.getElementById('fb-status');
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = color;
+    el.style.background = bg;
+  }
+
+  // ── Lưu thông tin kết nối lên Firebase ──
+  window._saveSheetConfig = function(cfg) {
+    // Lưu vào doc riêng theo từng chế độ: sheetConnection_apikey hoặc sheetConnection_sa
+    var docName = cfg.mode === 'sa' ? 'sheetConnection_sa' : 'sheetConnection_apikey';
+    var data = { savedAt: new Date().toISOString() };
+    ['mode','sheetUrl','sheetTab','apiKey','saEmail','privateKey'].forEach(function(k) {
+      if (cfg[k]) data[k] = cfg[k];
+    });
+    _db.collection('config').doc(docName).set(data)
+      .then(function() { window.addLog && window.addLog('Đã lưu kết nối [' + (cfg.mode === 'sa' ? 'Service Account' : 'API Key') + '] lên Firebase ✓', 'success'); })
+      .catch(function(e) { window.addLog && window.addLog('Lỗi lưu Firebase: ' + e.message, 'error'); });
+  };
+
+  // ── Lưu mapping cột lên Firebase ──
+  window._saveColMapping = function(mapping) {
+    var data = Object.assign({}, mapping, { savedAt: new Date().toISOString() });
+    _db.collection('config').doc('colMapping').set(data)
+      .then(function() { window.addLog && window.addLog('Đã lưu cấu hình mapping cột lên Firebase ✓', 'success'); })
+      .catch(function(e) { window.addLog && window.addLog('Lỗi lưu mapping: ' + e.message, 'error'); });
+  };
+
+  // ── Đọc config khi app khởi động ──
+  document.addEventListener('DOMContentLoaded', function() {
+    _setFbStatus('Firebase...', '#7d4e00', '#fff3cd');
+
+    Promise.all([
+      _db.collection('config').doc('sheetConnection_apikey').get(),
+      _db.collection('config').doc('sheetConnection_sa').get(),
+      _db.collection('config').doc('colMapping').get()
+    ]).then(function(results) {
+      var snapApiKey = results[0];
+      var snapSA     = results[1];
+      var snapMap    = results[2];
+
+      // 1. Khôi phục form API Key
+      if (snapApiKey.exists) {
+        var c = snapApiKey.data();
+        if (c.sheetUrl) document.getElementById('f-url').value = c.sheetUrl;
+        if (c.sheetTab) document.getElementById('f-tab').value = c.sheetTab;
+        if (c.apiKey)   document.getElementById('f-key').value = c.apiKey;
+        window._savedApiKeyCfg = c;
+        window.addLog && window.addLog('Đã tải cấu hình API Key từ Firebase', 'success');
+      }
+
+      // 2. Khôi phục form Service Account
+      if (snapSA.exists) {
+        var s = snapSA.data();
+        if (s.sheetUrl) document.getElementById('sa-url').value = s.sheetUrl;
+        if (s.sheetTab) document.getElementById('sa-tab').value = s.sheetTab;
+        if (s.saEmail)  document.getElementById('sa-email').value = s.saEmail;
+        window._savedSACfg = s;
+        window.addLog && window.addLog('Đã tải cấu hình Service Account từ Firebase', 'success');
+      }
+
+      // 3. Khôi phục mapping cột
+      if (snapMap.exists) {
+        var m = snapMap.data();
+        ['id','cu','s1','s2','s3','s4','dl'].forEach(function(k) {
+          var el = document.getElementById('m-' + k);
+          if (el && m[k]) el.value = m[k];
+        });
+        window.addLog && window.addLog('Đã tải mapping cột từ Firebase', 'success');
+      }
+
+      _setFbStatus('Firebase ✓', '#2d6a4f', '#d8f3dc');
+
+      // 4. Mở modal nếu chưa có config nào
+      if (!snapApiKey.exists && !snapSA.exists) {
+        window.addLog && window.addLog('Chưa có cấu hình — hãy nhập thông tin Sheet', 'info');
+        setTimeout(function() { document.getElementById('overlay').classList.add('open'); }, 600);
+        return;
+      }
+
+      // 5. Tự động đồng bộ — đợi autoSync sẵn sàng rồi mới gọi
+      var cfgToSync = null;
+      if (snapSA.exists && snapSA.data().privateKey) {
+        cfgToSync = snapSA.data();
+      } else if (snapApiKey.exists && snapApiKey.data().apiKey) {
+        cfgToSync = snapApiKey.data();
+      }
+      if (cfgToSync) {
+        var _cfg = cfgToSync;
+        var _tries = 0;
+        var _wait = setInterval(function() {
+          _tries++;
+          if (typeof window.autoSync === 'function') {
+            clearInterval(_wait);
+            window.autoSync(_cfg);
+          } else if (_tries > 20) { // timeout sau 2 giây
+            clearInterval(_wait);
+            window.addLog && window.addLog('Không thể tự động đồng bộ', 'error');
+          }
+        }, 100);
+      }
+
+    }).catch(function(e) {
+      _setFbStatus('Firebase ✗', '#9b2226', '#fde8e8');
+      window.addLog && window.addLog('Lỗi Firebase: ' + e.message, 'error');
+    });
+  });
+</script>
+<style>
+  :root {
+    --bg: #f5f4f0;
+    --surface: #ffffff;
+    --surface2: #f0efe9;
+    --border: #e2e0d8;
+    --border2: #cccab8;
+    --text: #1a1916;
+    --text2: #6b6960;
+    --text3: #9e9c92;
+    --accent: #1a1916;
+    --accent-fg: #ffffff;
+    --green: #2d6a4f;
+    --green-bg: #d8f3dc;
+    --amber: #7d4e00;
+    --amber-bg: #fff3cd;
+    --red: #9b2226;
+    --red-bg: #fde8e8;
+    --blue: #1a4e8c;
+    --blue-bg: #dbeafe;
+    --gray-bg: #ececec;
+    --gray: #555;
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Be Vietnam Pro', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* ── TOPBAR ── */
+  .topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand-icon {
+    width: 32px; height: 32px;
+    background: var(--accent);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .brand-icon svg { width: 17px; height: 17px; }
+  .brand-name { font-size: 15px; font-weight: 600; }
+  .brand-sub { font-size: 11px; color: var(--text3); margin-top: 1px; }
+  .topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+  /* ── BUTTONS ── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 12px; font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--border2);
+    background: var(--surface);
+    color: var(--text);
+    font-family: inherit;
+    transition: background 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface2); }
+  .btn-dark {
+    background: var(--accent); color: var(--accent-fg);
+    border-color: var(--accent);
+  }
+  .btn-dark:hover { background: #2d2d28; }
+  .btn svg { flex-shrink: 0; }
+
+  /* ── TABS ── */
+  .nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 28px;
+    display: flex; gap: 0;
+  }
+  .nav-tab {
+    padding: 14px 18px;
+    font-size: 13px; font-weight: 500;
+    color: var(--text2);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .nav-tab:hover { color: var(--text); }
+  .nav-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  /* ── MAIN CONTENT ── */
+  .main { padding: 24px 28px; max-width: 1400px; }
+
+  /* ── STAT CARDS ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  .stat-step {
+    font-size: 11px; font-weight: 500;
+    color: var(--text3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .step-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+  }
+  .stat-num { font-size: 28px; font-weight: 600; color: var(--text); line-height: 1; }
+  .stat-detail { margin-top: 8px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .stat-pill {
+    font-size: 11px; padding: 2px 7px;
+    border-radius: 99px; font-weight: 500;
+  }
+
+  /* ── TABLE CARD ── */
+  .table-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .table-hdr {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center;
+    justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+  }
+  .table-hdr-title { font-size: 13px; font-weight: 600; }
+  .table-controls { display: flex; gap: 8px; align-items: center; }
+  .search-inp {
+    padding: 6px 12px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border2);
+    font-size: 12px; font-family: inherit;
+    background: var(--surface2);
+    color: var(--text);
+    width: 180px;
+  }
+  .search-inp:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+  .filter-sel {
+    padding: 6px 10px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border2);
+    font-size: 12px; font-family: inherit;
+    background: var(--surface2); color: var(--text);
+    cursor: pointer;
+  }
+  .filter-sel:focus { outline: none; }
+
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    font-size: 11px; font-weight: 600;
+    color: var(--text3);
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    vertical-align: middle;
+    font-size: 13px;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: #fafaf7; }
+
+  /* ── BADGES ── */
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+  }
+  .badge::before { content:''; width:5px; height:5px; border-radius:50%; }
+  .b-done { background: var(--green-bg); color: var(--green); }
+  .b-done::before { background: var(--green); }
+  .b-doing { background: var(--amber-bg); color: var(--amber); }
+  .b-doing::before { background: #d4850a; }
+  .b-todo { background: var(--gray-bg); color: var(--gray); }
+  .b-todo::before { background: #aaa; }
+  .b-late { background: var(--red-bg); color: var(--red); }
+  .b-late::before { background: var(--red); }
+  .b-prog { background: var(--blue-bg); color: var(--blue); }
+  .b-prog::before { background: var(--blue); }
+
+  /* ── PROGRESS ── */
+  .prog-wrap { display: flex; align-items: center; gap: 7px; }
+  .prog-track {
+    height: 5px; width: 72px;
+    background: var(--surface2);
+    border-radius: 99px; overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .prog-fill { height: 100%; border-radius: 99px; transition: width 0.3s; }
+  .prog-pct { font-size: 11px; color: var(--text3); min-width: 28px; font-family: 'JetBrains Mono', monospace; }
+
+  /* ── EMPTY STATE ── */
+  .empty-state {
+    text-align: center; padding: 48px 20px;
+    color: var(--text3);
+  }
+  .empty-state svg { margin-bottom: 12px; opacity: 0.4; }
+  .empty-state p { font-size: 13px; }
+
+  /* ── MODAL OVERLAY ── */
+  .overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(26,25,22,0.55);
+    z-index: 200;
+    align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 100%; max-width: 420px;
+    border: 1px solid var(--border);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+  }
+  .modal-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .modal-sub { font-size: 12px; color: var(--text2); margin-bottom: 20px; }
+  .form-group { margin-bottom: 14px; }
+  .form-label { display: block; font-size: 11px; font-weight: 600; color: var(--text2); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .form-inp {
+    width: 100%; padding: 9px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border2);
+    font-size: 13px; font-family: inherit;
+    background: var(--surface2); color: var(--text);
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .form-inp:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+  .form-hint { font-size: 11px; color: var(--text3); margin-top: 4px; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 20px; }
+  .modal-actions .btn { flex: 1; justify-content: center; }
+
+  /* ── CONFIG TAB ── */
+  .config-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px; margin-bottom: 16px;
+  }
+  .config-title {
+    font-size: 12px; font-weight: 600;
+    color: var(--text2); text-transform: uppercase;
+    letter-spacing: 0.06em; margin-bottom: 14px;
+  }
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .config-grid-2 { display: grid; grid-template-columns: 180px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .config-col-name { font-size: 12px; color: var(--text2); }
+  .config-col-default { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text3); }
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: var(--surface2);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--text2);
+  }
+
+  /* ── LOG TAB ── */
+  .log-item {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .log-item:last-child { border-bottom: none; }
+  .log-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 4px; }
+  .log-msg { font-size: 13px; color: var(--text); }
+  .log-time { font-size: 11px; color: var(--text3); margin-top: 2px; font-family: 'JetBrains Mono', monospace; }
+
+  /* ── SPINNER ── */
+  .spinner {
+    display: inline-block; width: 13px; height: 13px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── UTIL ── */
+  .hidden { display: none !important; }
+  .order-id { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
+  .deadline-late { color: var(--red); font-weight: 600; }
+  .sync-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--green-bg); color: var(--green);
+    padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 500;
+  }
+  .fb-status {
+    display: inline-flex; align-items: center;
+    padding: 4px 10px; border-radius: 99px;
+    font-size: 11px; font-weight: 500;
+    background: #fff3cd; color: #7d4e00;
+    transition: background 0.3s, color 0.3s;
+  }
+</style>
+</head>
+<body>
+
+<!-- MODAL -->
+<div class="overlay" id="overlay">
+  <div class="modal" style="max-width:480px;">
+    <div class="modal-title">Kết nối Google Sheet</div>
+    <div class="modal-sub">Chọn chế độ kết nối phù hợp với cách bạn thiết lập Google Sheet</div>
+
+    <!-- Mode tabs -->
+    <div style="display:flex;gap:0;border:1px solid var(--border2);border-radius:var(--radius-sm);overflow:hidden;margin-bottom:18px;">
+      <button id="mode-tab-1" onclick="switchMode(1)"
+        style="flex:1;padding:9px 0;font-size:12px;font-weight:500;font-family:inherit;cursor:pointer;border:none;background:#1a1916;color:#fff;transition:all 0.15s;">
+        🔑 API Key
+      </button>
+      <button id="mode-tab-2" onclick="switchMode(2)"
+        style="flex:1;padding:9px 0;font-size:12px;font-weight:500;font-family:inherit;cursor:pointer;border:none;background:var(--surface2);color:var(--text2);transition:all 0.15s;">
+        🔒 Service Account
+      </button>
+    </div>
+
+    <!-- Chế độ 1: API Key -->
+    <div id="mode-1">
+      <div style="background:var(--surface2);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--text2);line-height:1.6;">
+        <strong>Ưu điểm:</strong> Đơn giản, nhanh<br>
+        <strong>Yêu cầu:</strong> Sheet phải chia sẻ công khai (Anyone with link)
+      </div>
+      <div class="form-group">
+        <label class="form-label">URL Google Sheet</label>
+        <input class="form-inp" id="f-url" type="url" placeholder="https://docs.google.com/spreadsheets/d/..." />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Tên tab (sheet)</label>
+        <input class="form-inp" id="f-tab" value="Sheet1" placeholder="Sheet1" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Google Sheets API Key</label>
+        <input class="form-inp" id="f-key" type="text" placeholder="AIzaSy..." />
+        <div class="form-hint">Google Cloud Console → APIs &amp; Services → Credentials → Create API Key</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-dark" onclick="doConnect()" style="flex:1.2;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M10 3H6a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h12a2 2 0 0 0 2-2v-4"/><path d="M14 3h7v7M21 3l-9 9"/></svg>
+          Kết nối
+        </button>
+        <button class="btn" onclick="loadDemo()">Dữ liệu mẫu</button>
+        <button class="btn" onclick="closeModal()">Huỷ</button>
+      </div>
+    </div>
+
+    <!-- Chế độ 2: Service Account -->
+    <div id="mode-2" style="display:none;">
+      <div style="background:#fffbea;border:1px solid #f0d060;border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:14px;font-size:12px;color:#7a5c00;line-height:1.6;">
+        <strong>Ưu điểm:</strong> Bảo mật hơn, không cần chia sẻ công khai<br>
+        <strong>Yêu cầu:</strong> Chỉ cần share Sheet cho email Service Account
+      </div>
+      <div class="form-group">
+        <label class="form-label">URL Google Sheet</label>
+        <input class="form-inp" id="sa-url" type="url" placeholder="https://docs.google.com/spreadsheets/d/..." />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Tên tab (sheet)</label>
+        <input class="form-inp" id="sa-tab" value="Sheet1" placeholder="Sheet1" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Service Account Email</label>
+        <input class="form-inp" id="sa-email" type="text" placeholder="name@project-id.iam.gserviceaccount.com" />
+        <div class="form-hint">Google Cloud Console → IAM &amp; Admin → Service Accounts → Create</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Private Key (JSON)</label>
+        <textarea class="form-inp" id="sa-key" rows="4"
+          placeholder='Dán nội dung file .json tải từ Service Account vào đây...'
+          style="resize:vertical;font-family:var(--font-mono,monospace);font-size:11px;line-height:1.5;"></textarea>
+        <div class="form-hint">Service Account → Keys → Add Key → JSON → tải file về → dán nội dung vào đây</div>
+      </div>
+      <div id="sa-share-hint" style="background:var(--surface2);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--text2);line-height:1.7;display:none;">
+        <strong>📋 Bước tiếp theo:</strong> Mở Google Sheet → Chia sẻ → Dán email bên dưới → Viewer<br>
+        <span id="sa-email-display" style="font-family:monospace;font-size:11px;background:var(--border);padding:2px 6px;border-radius:4px;display:inline-block;margin-top:4px;word-break:break-all;"></span>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-dark" onclick="doConnectSA()" style="flex:1.2;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Kết nối
+        </button>
+        <button class="btn" onclick="loadDemo()">Dữ liệu mẫu</button>
+        <button class="btn" onclick="closeModal()">Huỷ</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8">
+        <rect x="2" y="10" width="20" height="8" rx="2.5"/>
+        <path d="M5 10V8a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2"/>
+        <path d="M5 18v2M19 18v2"/>
+      </svg>
+    </div>
+    <div>
+      <div class="brand-name">Sofa Production Manager</div>
+      <div class="brand-sub" id="sync-label">Chưa kết nối dữ liệu</div>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span class="fb-status" id="fb-status">Firebase...</span>
+    <button class="btn" onclick="openModal()">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93A10 10 0 1 1 4.93 19.07"/><path d="M20.66 8.3A10 10 0 0 1 21 12"/></svg>
+      Kết nối Sheet
+    </button>
+    <button class="btn btn-dark" id="sync-btn" onclick="doSync()">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+      Đồng bộ
+    </button>
+  </div>
+</div>
+
+<!-- NAV TABS -->
+<div class="nav">
+  <div class="nav-tab active" onclick="showTab('orders', this)">Đơn hàng</div>
+  <div class="nav-tab" onclick="showTab('config', this)">Cấu hình cột</div>
+  <div class="nav-tab" onclick="showTab('log', this)">Lịch sử đồng bộ</div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- TAB: ĐƠN HÀNG -->
+  <div id="tab-orders">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-step"><span class="step-dot" style="background:#1a4e8c;"></span>Bước 1 – Lên form dáng</div>
+        <div class="stat-num" id="sc1">—</div>
+        <div class="stat-detail" id="sd1"></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-step"><span class="step-dot" style="background:#7d4e00;"></span>Bước 2 – Cắt gỗ</div>
+        <div class="stat-num" id="sc2">—</div>
+        <div class="stat-detail" id="sd2"></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-step"><span class="step-dot" style="background:#2d6a4f;"></span>Bước 3 – Thi công</div>
+        <div class="stat-num" id="sc3">—</div>
+        <div class="stat-detail" id="sd3"></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-step"><span class="step-dot" style="background:#9b2226;"></span>Bước 4 – Nhồi nệm</div>
+        <div class="stat-num" id="sc4">—</div>
+        <div class="stat-detail" id="sd4"></div>
+      </div>
+    </div>
+
+    <div class="table-card">
+      <div class="table-hdr">
+        <span class="table-hdr-title">Danh sách đơn hàng</span>
+        <div class="table-controls">
+          <input class="search-inp" id="q" placeholder="🔍  Tìm đơn hàng, khách hàng..." oninput="render()" />
+          <select class="filter-sel" id="flt" onchange="render()">
+            <option value="">Tất cả</option>
+            <option value="late">⚠ Trễ hạn</option>
+            <option value="doing">Đang làm</option>
+            <option value="done">Hoàn thành</option>
+          </select>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Mã đơn</th>
+              <th>Khách hàng</th>
+              <th>Lên form dáng</th>
+              <th>Cắt gỗ</th>
+              <th>Thi công</th>
+              <th>Nhồi nệm</th>
+              <th>Tiến độ</th>
+              <th>Deadline</th>
+              <th>Tình trạng</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div id="empty-state" class="empty-state hidden">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <p id="empty-msg">Nhấn <strong>Kết nối Sheet</strong> hoặc <strong>Dữ liệu mẫu</strong> để bắt đầu</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB: CẤU HÌNH CỘT -->
+  <div id="tab-config" class="hidden">
+    <div class="config-section">
+      <div class="config-title">Mapping tên cột</div>
+      <p style="font-size:12px;color:var(--text2);margin-bottom:16px;line-height:1.7;">Nếu tên cột trong Google Sheet của bạn khác với tên mặc định, nhập tên thực tế vào ô bên phải. Để trống = dùng tên mặc định.</p>
+      <div>
+        <div class="config-grid-2" style="font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">
+          <div>Trường dữ liệu</div><div>Tên cột trong sheet của bạn</div>
+        </div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">Mã đơn hàng</div><div class="config-col-default"><code>order_id</code></div></div><input class="form-inp" id="m-id" placeholder="order_id" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">Tên khách hàng</div><div class="config-col-default"><code>customer</code></div></div><input class="form-inp" id="m-cu" placeholder="customer" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">TT Bước 1 – Lên form dáng</div><div class="config-col-default"><code>step1_status</code></div></div><input class="form-inp" id="m-s1" placeholder="step1_status" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">TT Bước 2 – Cắt gỗ</div><div class="config-col-default"><code>step2_status</code></div></div><input class="form-inp" id="m-s2" placeholder="step2_status" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">TT Bước 3 – Thi công</div><div class="config-col-default"><code>step3_status</code></div></div><input class="form-inp" id="m-s3" placeholder="step3_status" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">TT Bước 4 – Nhồi nệm</div><div class="config-col-default"><code>step4_status</code></div></div><input class="form-inp" id="m-s4" placeholder="step4_status" /></div>
+        <div class="config-grid-2"><div><div style="font-size:13px;">Ngày giao hàng</div><div class="config-col-default"><code>deadline</code></div></div><input class="form-inp" id="m-dl" placeholder="deadline" /></div>
+      </div>
+      <div style="margin-top:16px;display:flex;gap:8px;">
+        <button class="btn btn-dark" onclick="saveCfg()">Lưu cấu hình</button>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <div class="config-title">Template Google Sheet mẫu</div>
+      <p style="font-size:12px;color:var(--text2);margin-bottom:14px;line-height:1.7;">Sao chép header bên dưới vào hàng đầu tiên của Google Sheet, sau đó điền dữ liệu từ hàng 2 trở đi. Giá trị trạng thái chấp nhận: <code>Xong</code> / <code>Đang làm</code> / <code>Chưa làm</code></p>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>order_id</th><th>customer</th><th>step1_status</th><th>step2_status</th><th>step3_status</th><th>step4_status</th><th>deadline</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="order-id">DH001</td><td>Nguyễn Văn A</td>
+              <td><span class="badge b-done">Xong</span></td>
+              <td><span class="badge b-done">Xong</span></td>
+              <td><span class="badge b-doing">Đang làm</span></td>
+              <td><span class="badge b-todo">Chưa làm</span></td>
+              <td>2025-05-10</td>
+            </tr>
+            <tr>
+              <td class="order-id">DH002</td><td>Trần Thị B</td>
+              <td><span class="badge b-done">Xong</span></td>
+              <td><span class="badge b-doing">Đang làm</span></td>
+              <td><span class="badge b-todo">Chưa làm</span></td>
+              <td><span class="badge b-todo">Chưa làm</span></td>
+              <td>2025-04-28</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <button class="btn" style="margin-top:12px;" onclick="copyTpl()">Sao chép dòng header</button>
+    </div>
+  </div>
+
+  <!-- TAB: LỊCH SỬ -->
+  <div id="tab-log" class="hidden">
+    <div class="config-section">
+      <div class="config-title">Lịch sử đồng bộ</div>
+      <div id="log-body">
+        <div class="empty-state" style="padding:32px 0;">
+          <p>Chưa có lịch sử đồng bộ</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+var orders = [];
+var logs = [];
+var connMode = 'apikey'; // 'apikey' hoặc 'sa'
+var sheetId = '', sheetTab = 'Sheet1', apiKey = '';
+var saEmail = '', saPrivKey = '';
+
+// Expose functions needed by Firebase module
+window.orders = orders;
+window.render = render;
+window.updateStats = updateStats;
+window.addLog = addLog;
+
+function openModal() { document.getElementById('overlay').classList.add('open'); }
+function closeModal() { document.getElementById('overlay').classList.remove('open'); }
+
+function showTab(name, el) {
+  ['orders','config','log'].forEach(function(t) {
+    var tab = document.getElementById('tab-' + t);
+    if (t === name) tab.classList.remove('hidden');
+    else tab.classList.add('hidden');
+  });
+  document.querySelectorAll('.nav-tab').forEach(function(t) { t.classList.remove('active'); });
+  el.classList.add('active');
+}
+
+function getStatus(v) {
+  if (!v) return 'todo';
+  var s = v.toLowerCase().trim();
+  if (['xong','done','hoàn thành','complete','completed','hoan thanh'].indexOf(s) >= 0) return 'done';
+  if (['đang làm','doing','dang lam','in progress','đang thực hiện'].indexOf(s) >= 0) return 'doing';
+  return 'todo';
+}
+
+function badge(v) {
+  var s = getStatus(v);
+  if (s === 'done') return '<span class="badge b-done">Xong</span>';
+  if (s === 'doing') return '<span class="badge b-doing">Đang làm</span>';
+  return '<span class="badge b-todo">Chưa làm</span>';
+}
+
+function prog(o) {
+  return Math.round([o.s1,o.s2,o.s3,o.s4].filter(function(x){return getStatus(x)==='done';}).length / 4 * 100);
+}
+
+function isLate(o) {
+  if (!o.dl) return false;
+  return new Date(o.dl) < new Date() && prog(o) < 100;
+}
+
+function render() {
+  orders = window.orders; // keep in sync
+  var q = (document.getElementById('q').value || '').toLowerCase();
+  var f = document.getElementById('flt').value;
+  var data = orders.filter(function(o) {
+    if (q && o.id.toLowerCase().indexOf(q) < 0 && o.cu.toLowerCase().indexOf(q) < 0) return false;
+    if (f === 'late') return isLate(o);
+    if (f === 'done') return prog(o) === 100;
+    if (f === 'doing') return prog(o) < 100 && !isLate(o);
+    return true;
+  });
+
+  var tbody = document.getElementById('tbody');
+  var empty = document.getElementById('empty-state');
+
+  if (!data.length) {
+    tbody.innerHTML = '';
+    empty.classList.remove('hidden');
+    document.getElementById('empty-msg').innerHTML = orders.length
+      ? 'Không tìm thấy đơn hàng phù hợp'
+      : 'Nhấn <strong>Kết nối Sheet</strong> hoặc <strong>Dữ liệu mẫu</strong> để bắt đầu';
+    return;
+  }
+
+  empty.classList.add('hidden');
+  tbody.innerHTML = data.map(function(o) {
+    var p = prog(o);
+    var l = isLate(o);
+    var progColor = p === 100 ? '#2d6a4f' : l ? '#c0392b' : '#1a4e8c';
+    var dlClass = l ? 'deadline-late' : '';
+    var dlStr = o.dl || '—';
+    if (l) dlStr += ' ⚠';
+    var tsBadge = l
+      ? '<span class="badge b-late">Trễ hạn</span>'
+      : p === 100
+        ? '<span class="badge b-done">Hoàn thành</span>'
+        : '<span class="badge b-prog">Đang xử lý</span>';
+    return '<tr>'
+      + '<td><span class="order-id">' + o.id + '</span></td>'
+      + '<td>' + o.cu + '</td>'
+      + '<td>' + badge(o.s1) + '</td>'
+      + '<td>' + badge(o.s2) + '</td>'
+      + '<td>' + badge(o.s3) + '</td>'
+      + '<td>' + badge(o.s4) + '</td>'
+      + '<td><div class="prog-wrap"><div class="prog-track"><div class="prog-fill" style="width:' + p + '%;background:' + progColor + ';"></div></div><span class="prog-pct">' + p + '%</span></div></td>'
+      + '<td class="' + dlClass + '" style="font-size:12px;">' + dlStr + '</td>'
+      + '<td>' + tsBadge + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+function updateStats() {
+  orders = window.orders;
+  [1,2,3,4].forEach(function(i) {
+    var key = 's' + i;
+    var total = orders.length;
+    var done  = orders.filter(function(o){ return getStatus(o[key]) === 'done'; }).length;
+    var doing = orders.filter(function(o){ return getStatus(o[key]) === 'doing'; }).length;
+    var todo  = total - done - doing;
+    document.getElementById('sc' + i).textContent = total || '—';
+    var det = document.getElementById('sd' + i);
+    if (!total) { det.innerHTML = ''; return; }
+    det.innerHTML =
+      (done  ? '<span class="stat-pill" style="background:var(--green-bg);color:var(--green);">' + done  + ' xong</span>' : '') +
+      (doing ? '<span class="stat-pill" style="background:var(--amber-bg);color:var(--amber);">' + doing + ' đang làm</span>' : '') +
+      (todo  ? '<span class="stat-pill" style="background:var(--gray-bg);color:var(--gray);">' + todo  + ' chờ</span>' : '');
+  });
+}
+
+function addLog(msg, type) {
+  var time = new Date().toLocaleString('vi-VN');
+  logs.unshift({ msg: msg, type: type, time: time });
+  var dot = { success: '#2d6a4f', error: '#9b2226', info: '#7d4e00' };
+  document.getElementById('log-body').innerHTML = logs.slice(0,30).map(function(l) {
+    return '<div class="log-item">'
+      + '<div class="log-dot" style="background:' + (dot[l.type]||'#aaa') + ';"></div>'
+      + '<div><div class="log-msg">' + l.msg + '</div><div class="log-time">' + l.time + '</div></div>'
+      + '</div>';
+  }).join('');
+}
+
+function getColVal(id, def) {
+  var el = document.getElementById(id);
+  return (el && el.value.trim()) || def;
+}
+
+function parseRows(rows) {
+  if (!rows || rows.length < 2) return [];
+  var hdr = rows[0].map(function(h){ return (h||'').toLowerCase().trim(); });
+  function idx(name) { return hdr.indexOf(name.toLowerCase().trim()); }
+  var fi = {
+    id: idx(getColVal('m-id', 'order_id')),
+    cu: idx(getColVal('m-cu', 'customer')),
+    s1: idx(getColVal('m-s1', 'step1_status')),
+    s2: idx(getColVal('m-s2', 'step2_status')),
+    s3: idx(getColVal('m-s3', 'step3_status')),
+    s4: idx(getColVal('m-s4', 'step4_status')),
+    dl: idx(getColVal('m-dl', 'deadline'))
+  };
+  return rows.slice(1).filter(function(r){ return r && r.some(function(c){return c;}); }).map(function(r) {
+    return {
+      id: fi.id >= 0 ? (r[fi.id] || '—') : '—',
+      cu: fi.cu >= 0 ? (r[fi.cu] || '—') : '—',
+      s1: fi.s1 >= 0 ? (r[fi.s1] || '') : '',
+      s2: fi.s2 >= 0 ? (r[fi.s2] || '') : '',
+      s3: fi.s3 >= 0 ? (r[fi.s3] || '') : '',
+      s4: fi.s4 >= 0 ? (r[fi.s4] || '') : '',
+      dl: fi.dl >= 0 ? (r[fi.dl] || '') : ''
+    };
+  });
+}
+
+// ── Chuyển chế độ kết nối ──
+function switchMode(m) {
+  document.getElementById('mode-1').style.display = m === 1 ? 'block' : 'none';
+  document.getElementById('mode-2').style.display = m === 2 ? 'block' : 'none';
+  document.getElementById('mode-tab-1').style.background = m === 1 ? '#1a1916' : 'var(--surface2)';
+  document.getElementById('mode-tab-1').style.color      = m === 1 ? '#fff'     : 'var(--text2)';
+  document.getElementById('mode-tab-2').style.background = m === 2 ? '#1a1916' : 'var(--surface2)';
+  document.getElementById('mode-tab-2').style.color      = m === 2 ? '#fff'     : 'var(--text2)';
+}
+
+// ── Kết nối chế độ 2: Service Account ──
+// Vì private key không thể gọi trực tiếp từ browser (CORS + bảo mật),
+// ta dùng Apps Script làm proxy: publish 1 Web App trên Google Apps Script
+// nhận sheetId + tab, trả về JSON dữ liệu, xác thực bằng email SA.
+// Cách đơn giản nhất trong browser: dùng Google Apps Script Web App (doGet).
+async function doConnectSA() {
+  var url    = document.getElementById('sa-url').value.trim();
+  var tab    = document.getElementById('sa-tab').value.trim() || 'Sheet1';
+  var email  = document.getElementById('sa-email').value.trim();
+  var keyRaw = document.getElementById('sa-key').value.trim();
+
+  if (!url || !email || !keyRaw) {
+    alert('Vui lòng nhập đầy đủ URL, Email và Private Key JSON.'); return;
+  }
+  var mUrl = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!mUrl) { alert('URL không hợp lệ.'); return; }
+
+  // Parse JSON key file
+  var keyJson;
+  try { keyJson = JSON.parse(keyRaw); } catch(e) { alert('File JSON không hợp lệ: ' + e.message); return; }
+
+  // Hiển thị email để user share sheet
+  document.getElementById('sa-email-display').textContent = keyJson.client_email || email;
+  document.getElementById('sa-share-hint').style.display = 'block';
+
+  var saConfig = {
+    mode: 'sa',
+    sheetUrl: url,
+    sheetTab: tab,
+    saEmail:  keyJson.client_email || email,
+    // Lưu private_key để tạo JWT
+    privateKey: keyJson.private_key,
+    savedAt: new Date().toISOString()
+  };
+
+  connMode   = 'sa';
+  sheetId    = mUrl[1];
+  sheetTab   = tab;
+  saEmail    = keyJson.client_email || email;
+  saPrivKey  = keyJson.private_key;
+
+  if (window._saveSheetConfig) window._saveSheetConfig(saConfig);
+  closeModal();
+  doSync();
+}
+
+// ── Tạo JWT cho Service Account (dùng Web Crypto API) ──
+async function makeJWT(email, privateKeyPem) {
+  var now = Math.floor(Date.now() / 1000);
+  var header  = { alg: 'RS256', typ: 'JWT' };
+  var payload = {
+    iss: email,
+    scope: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  };
+  var b64 = function(obj) {
+    return btoa(JSON.stringify(obj)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  };
+  var sigInput = b64(header) + '.' + b64(payload);
+
+  // Import PEM private key
+  var pemBody = privateKeyPem.replace(/-----[^-]+-----/g,'').replace(/\s/g,'');
+  var keyBuf  = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0)).buffer;
+  var cryptoKey = await crypto.subtle.importKey(
+    'pkcs8', keyBuf,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false, ['sign']
+  );
+  var sig = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5', cryptoKey,
+    new TextEncoder().encode(sigInput)
+  );
+  var b64Sig = btoa(String.fromCharCode(...new Uint8Array(sig)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+  return sigInput + '.' + b64Sig;
+}
+
+// ── Lấy Access Token từ Service Account JWT ──
+async function getAccessToken(email, privateKey) {
+  var jwt = await makeJWT(email, privateKey);
+  var res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=' + jwt
+  });
+  var data = await res.json();
+  if (!data.access_token) throw new Error(data.error_description || 'Không lấy được token');
+  return data.access_token;
+}
+
+function doConnect() {
+  var url = document.getElementById('f-url').value.trim();
+  var tab = document.getElementById('f-tab').value.trim() || 'Sheet1';
+  var key = document.getElementById('f-key').value.trim();
+  if (!url || !key) { alert('Vui lòng nhập đầy đủ URL Google Sheet và API Key.'); return; }
+  var m = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!m) { alert('URL không hợp lệ. Vui lòng kiểm tra lại.'); return; }
+  connMode = 'apikey';
+  sheetId = m[1]; sheetTab = tab; apiKey = key;
+  if (window._saveSheetConfig) {
+    window._saveSheetConfig({ mode: 'apikey', sheetUrl: url, sheetTab: tab, apiKey: key });
+  }
+  closeModal();
+  doSync();
+}
+
+async function doSync() {
+  // Khôi phục từ Firebase nếu chưa có config
+  if (!sheetId) {
+    var saved = window._savedSheetCfg;
+    if (saved && saved.sheetUrl) {
+      var mx = saved.sheetUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      if (mx) {
+        sheetId   = mx[1];
+        sheetTab  = saved.sheetTab || 'Sheet1';
+        connMode  = saved.mode || 'apikey';
+        apiKey    = saved.apiKey || '';
+        saEmail   = saved.saEmail || '';
+        saPrivKey = saved.privateKey || '';
+      }
+    } else { openModal(); return; }
+  }
+
+  var btn = document.getElementById('sync-btn');
+  btn.innerHTML = '<div class="spinner"></div> Đang đồng bộ...';
+  btn.disabled = true;
+
+  try {
+    var range = encodeURIComponent(sheetTab + '!A:Z');
+    var fetchUrl, fetchOpts = {};
+
+    if (connMode === 'sa' && saEmail && saPrivKey) {
+      // Chế độ Service Account — lấy access token trước
+      var token = await getAccessToken(saEmail, saPrivKey);
+      fetchUrl  = 'https://sheets.googleapis.com/v4/spreadsheets/' + sheetId + '/values/' + range;
+      fetchOpts = { headers: { 'Authorization': 'Bearer ' + token } };
+    } else {
+      // Chế độ API Key
+      fetchUrl = 'https://sheets.googleapis.com/v4/spreadsheets/' + sheetId + '/values/' + range + '?key=' + apiKey;
+    }
+
+    var res = await fetch(fetchUrl, fetchOpts);
+    if (!res.ok) {
+      var err = await res.json();
+      throw new Error((err.error && err.error.message) || 'Lỗi ' + res.status);
+    }
+    var data = await res.json();
+    var parsed = parseRows(data.values || []);
+    window.orders = parsed;
+    orders = parsed;
+    render(); updateStats();
+    var now = new Date().toLocaleString('vi-VN');
+    var modeLabel = connMode === 'sa' ? '🔒 SA' : '🔑 API Key';
+    document.getElementById('sync-label').innerHTML = modeLabel + ' · ' + now + ' &nbsp;·&nbsp; ' + orders.length + ' đơn';
+    addLog('Đồng bộ thành công [' + (connMode==='sa'?'Service Account':'API Key') + '] — ' + orders.length + ' đơn', 'success');
+  } catch(e) {
+    addLog('Lỗi đồng bộ: ' + e.message, 'error');
+    alert('Không thể đồng bộ: ' + e.message);
+  }
+  btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg> Đồng bộ';
+  btn.disabled = false;
+}
+
+function loadDemo() {
+  closeModal();
+  var demo = [
+    { id:'DH001', cu:'Nguyễn Văn An',    s1:'Xong',     s2:'Xong',     s3:'Đang làm', s4:'Chưa làm', dl:'2025-05-20' },
+    { id:'DH002', cu:'Trần Thị Bích',    s1:'Xong',     s2:'Đang làm', s3:'Chưa làm', s4:'Chưa làm', dl:'2025-04-20' },
+    { id:'DH003', cu:'Lê Hoàng Cường',   s1:'Xong',     s2:'Xong',     s3:'Xong',     s4:'Xong',     dl:'2025-03-01' },
+    { id:'DH004', cu:'Phạm Minh Đức',    s1:'Đang làm', s2:'Chưa làm', s3:'Chưa làm', s4:'Chưa làm', dl:'2025-06-01' },
+    { id:'DH005', cu:'Hoàng Thu Hà',     s1:'Xong',     s2:'Xong',     s3:'Đang làm', s4:'Chưa làm', dl:'2025-04-15' },
+    { id:'DH006', cu:'Vũ Quang Hải',     s1:'Chưa làm', s2:'Chưa làm', s3:'Chưa làm', s4:'Chưa làm', dl:'2025-07-10' },
+    { id:'DH007', cu:'Đặng Hương Giang', s1:'Xong',     s2:'Xong',     s3:'Xong',     s4:'Đang làm', dl:'2025-05-05' },
+    { id:'DH008', cu:'Bùi Thanh Tùng',   s1:'Xong',     s2:'Đang làm', s3:'Chưa làm', s4:'Chưa làm', dl:'2025-04-10' },
+  ];
+  window.orders = demo;
+  orders = demo;
+  render(); updateStats();
+  document.getElementById('sync-label').textContent = 'Dữ liệu mẫu · ' + orders.length + ' đơn hàng';
+  addLog('Đã tải dữ liệu mẫu — ' + orders.length + ' đơn hàng', 'success');
+}
+
+function saveCfg() {
+  var mapping = {
+    id: document.getElementById('m-id').value.trim() || 'order_id',
+    cu: document.getElementById('m-cu').value.trim() || 'customer',
+    s1: document.getElementById('m-s1').value.trim() || 'step1_status',
+    s2: document.getElementById('m-s2').value.trim() || 'step2_status',
+    s3: document.getElementById('m-s3').value.trim() || 'step3_status',
+    s4: document.getElementById('m-s4').value.trim() || 'step4_status',
+    dl: document.getElementById('m-dl').value.trim() || 'deadline'
+  };
+  if (window._saveColMapping) {
+    window._saveColMapping(mapping);
+  } else {
+    addLog('Đã lưu cấu hình mapping cột', 'info');
+    alert('Đã lưu! Nhấn Đồng bộ để áp dụng.');
+  }
+}
+
+function copyTpl() {
+  var txt = 'order_id\tcustomer\tstep1_status\tstep2_status\tstep3_status\tstep4_status\tdeadline';
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(txt).then(function(){ alert('Đã sao chép header vào clipboard!\n\nDán vào hàng đầu tiên của Google Sheet.'); });
+  } else {
+    alert('Header: ' + txt);
+  }
+}
+
+// autoSync được gọi từ Firebase sau khi load config
+window.autoSync = function(cfg) {
+  var mx = cfg.sheetUrl && cfg.sheetUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!mx) return;
+  sheetId   = mx[1];
+  sheetTab  = cfg.sheetTab   || 'Sheet1';
+  connMode  = cfg.mode       || 'apikey';
+  apiKey    = cfg.apiKey     || '';
+  saEmail   = cfg.saEmail    || '';
+  saPrivKey = cfg.privateKey || '';
+  doSync();
+};
+
+// init
+render();
+</script>
+</body>
+</html>
